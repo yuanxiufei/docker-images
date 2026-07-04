@@ -20,7 +20,34 @@
 
 ---
 
-## 一、环境与前置条件
+## 〇、部署平台选择（三选一）
+
+本项目支持三种部署方式，根据你的操作系统选择其一：
+
+| 方案 | 适用场景 | 性能 | GPU 支持 | 复杂度 |
+|---|---|---|---|---|
+| **WSL2** (本文主打) | Windows 用户不想装虚拟机，日常开发 | 中等（9P 文件系统有损耗） | ✅ 需要 nvidia-toolkit | 中 |
+| **Docker Desktop** | Windows 用户要 GUI 管理，不想碰命令行 | 中等（WSL2/Hyper-V 后端） | ✅ 内置 GPU 支持 | 低 |
+| **原生 Linux** | 双系统 Linux、服务器、追求最佳性能 | 最高（无虚拟化层） | ✅ 原生 CUDA | 低 |
+
+> 💡 **双系统提示**：如果你装了 Windows + Linux 双系统，Docker 数据卷（models、images、data）可以放在共享的 NTFS 分区，两边共用。详见 [附录 E：双系统共享数据](#附录-e双系统共享数据)。
+
+### 方案对比速查
+
+| 对比维度 | WSL2 | Docker Desktop (Win) | 原生 Linux |
+|---|---|---|---|
+| Docker 安装方式 | `apt install docker.io` | 下载 exe 安装包 | `apt/dnf install docker` |
+| daemon 管理 | 手动 `sudo dockerd &` | 自动（系统服务） | `systemctl start docker` |
+| 路径访问宿主机 | `/mnt/c/` `/mnt/d/` | 自动映射（无需前缀） | 直接访问 `/path/` |
+| daemon.json 位置 | `/etc/docker/daemon.json` | `%USERPROFILE%\.docker\daemon.json` | `/etc/docker/daemon.json` |
+| GPU 配置 | 手动安装 nvidia-container-toolkit | Docker Desktop 内置 | 手动安装 nvidia-container-toolkit |
+| vLLM UVA | ❌ 需 patch | ❌ 需 patch（WSL2后端同样） | ✅ 原生支持 |
+| 文件系统 | ext4（推荐） | NTFS（default） | ext4/xfs |
+| 进入方式 | `wsl -d Ubuntu-24.04` | 直接打开 PowerShell/CMD | 直接登录 |
+
+---
+
+## 一、环境与前置条件（WSL2 方案）
 
 | 项 | 详情 |
 |---|---|
@@ -149,15 +176,18 @@ Prometheus     → http://localhost:9090
 
 ## 四、快速部署
 
+> 💡 根据你的平台选择对应步骤：[WSL2](#四快速部署) · [Docker Desktop](#c4-部署步骤windows-powershell) · [原生 Linux](#d3-原生-linux-极简部署流程)
+
 ```bash
-# 1. 进入 WSL
+# 1. 进入 WSL（仅 WSL2 用户需要）
 wsl -d Ubuntu-24.04
 
-# 2. 启动 Docker（如未运行）
+# 2. 启动 Docker（仅 WSL2 需要，Desktop/Linux 跳过此步）
 sudo dockerd &> /tmp/dockerd.log &
 
 # 3. 进入项目目录
-cd /mnt/d/docker-images
+cd /mnt/d/docker-images       # WSL2
+# cd /home/user/docker-images  # 原生 Linux
 
 # 4. 加载镜像
 docker load -i infra-images-latest.tar          # PG + Redis + Qdrant
@@ -630,3 +660,350 @@ ingress:
     service: http://localhost:11434
   - service: http_status:404
 ```
+
+---
+
+## 附录 C：Windows 原生部署（Docker Desktop）
+
+> 适用于不想安装 WSL2、偏好图形化管理的 Windows 用户。
+
+### C.1 安装 Docker Desktop
+
+1. 下载 [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/)
+2. 运行安装程序，推荐选择 **"Use WSL 2 instead of Hyper-V"**（性能更好）
+3. 安装完成后重启电脑
+4. 打开 Docker Desktop，等待右下角鲸鱼图标变绿（Engine running）
+
+```powershell
+# 验证安装
+docker --version
+docker ps
+```
+
+### C.2 GPU 支持配置
+
+Docker Desktop 4.30+ **内置** NVIDIA Container Toolkit，无需手动安装。
+
+**配置步骤**：
+1. Docker Desktop → Settings（⚙️ 齿轮图标）
+2. → Resources → Advanced → **Enable GPU** ✅ 勾选
+3. 点击 "Apply & Restart"
+
+```powershell
+# 验证 GPU 可用
+docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+```
+
+> ⚠️ 如果报错 `could not select device driver "nvidia"`，在 Settings → Docker Engine 中确认 daemon.json 包含：
+>
+> ```json
+> {
+>   "runtimes": {
+>     "nvidia": {
+>       "path": "nvidia-container-runtime",
+>       "runtimeArgs": []
+>     }
+>   }
+> }
+> ```
+
+### C.3 daemon.json 配置
+
+**Windows 上的 daemon.json 位置**：`%USERPROFILE%\.docker\daemon.json`
+
+在 Docker Desktop → Settings → Docker Engine 中直接编辑更方便：
+
+```json
+{
+  "data-root": "D:\\docker-data",
+  "runtimes": {
+    "nvidia": {
+      "path": "nvidia-container-runtime",
+      "runtimeArgs": []
+    }
+  }
+}
+```
+
+> ⚠️ **与 WSL2/Linux 的路径差异**：Windows 用反斜杠 `\`，JSON 中需转义为 `\\`。建议 data-root 指向 SSD 分区。
+
+### C.4 部署步骤（Windows PowerShell）
+
+```powershell
+# 1. 确保 Docker Desktop 正在运行（右下角鲸鱼图标绿色）
+
+# 2. 进入项目目录（Windows 原生命令行）
+cd D:\docker-images
+
+# 3. 加载镜像（与 WSL2 完全相同）
+docker load -i infra-images-latest.tar
+docker load -i monitoring-images-latest.tar
+docker load -i ollama-latest.tar
+docker load -i vllm-openai-latest.tar          # 可选
+docker load -i open-webui-main.tar
+
+# 4. 创建网络 + 启动
+docker network create backend 2>$null
+docker network create llm-net 2>$null
+docker compose up -d
+
+# 5. 验证
+docker ps
+```
+
+> 💡 **Windows 上不需要手动启动 dockerd** — Docker Desktop 作为系统服务开机自启。
+>
+> 💡 **`2>/dev/null` 在 PowerShell 中需改为 `2>$null`**。
+
+### C.5 Windows 下 Compose 文件的路径写法
+
+`compose.yml` 中的 volume 挂载路径需要适配 Windows：
+
+```yaml
+# ❌ WSL2 写法（Windows 上不生效）
+volumes:
+  - /mnt/d/app/LLM/models:/root/.cache/huggingface:ro
+
+# ✅ Windows 写法（两种均可）
+volumes:
+  # 方式一：Windows 绝对路径
+  - D:\app\LLM\models\huggingface:/root/.cache/huggingface:ro
+
+  # 方式二：相对路径（推荐，跨平台兼容）
+  - ./models/huggingface:/root/.cache/huggingface:ro
+```
+
+> 💡 **相对路径 `./` 是跨 Windows/WSL2/Linux 的最好选择**，把模型放到项目的 `models/` 目录下即可。
+
+### C.6 Windows vs WSL2 关键差异
+
+| 项目 | Windows (Docker Desktop) | WSL2 |
+|---|---|---|
+| 启动 Docker | 自动（系统服务） | 手动 `sudo dockerd &` |
+| 命令行 | PowerShell / CMD | WSL Bash |
+| 路径前缀 | `D:\data` | `/mnt/d/data` |
+| GPU 配置 | GUI 勾选 | CLI 安装 nvidia-toolkit |
+| 文件性能 | 良好 | ext4 上最优，NTFS 挂载较慢 |
+| daemon.json | `%USERPROFILE%\.docker\daemon.json` | `/etc/docker/daemon.json` |
+| Docker Compose | 内置 `docker compose`（插件） | 需安装 `docker-compose-v2` |
+
+### C.7 Windows 特有注意事项
+
+1. **换行符问题**：`.sh` 脚本文件（如 `vllm_entrypoint.sh`）必须用 **LF** 换行，不可用 CRLF。
+   ```powershell
+   # VS Code 右下角点击 CRLF → 选择 LF
+   # 或用 Git 配置
+   git config --global core.autocrlf input
+   ```
+
+2. **文件权限**：Windows NTFS 没有 Linux 权限概念，Docker 容器内看到的文件默认 `777`。如有安全需求，在 compose 中加 `:ro` 只读挂载。
+
+3. **端口占用**：Windows 上 80/443 端口可能被 IIS 或 WSL 占用。
+   ```powershell
+   # 查看端口占用
+   netstat -ano | findstr :3090
+   # 如被占用，改 compose 映射端口
+   ```
+
+4. **防火墙**：首次启动时 Windows 防火墙可能弹窗，选择"允许访问"。
+
+5. **Docker Desktop 内存**：Settings → Resources → Advanced，建议 Memory 至少 **8GB**（跑 7B 模型需 16GB+）。
+
+---
+
+## 附录 D：原生 Linux 部署差异
+
+> 适用于双系统 Linux、Ubuntu/Debian/CentOS 服务器等场景。
+
+### D.1 与 WSL2 的相同之处
+
+以下内容完全一致，直接复用本文档：
+
+- ✅ Compose 配置文件（`compose.yml`）
+- ✅ `docker load -i xxx.tar` 加载离线镜像
+- ✅ `docker compose up -d` 启动服务
+- ✅ 所有容器的端口、账号密码、API 调用方式
+- ✅ Network 创建方式
+- ✅ `nvidia-container-toolkit` 安装步骤（与 WSL2 第一章完全一致）
+
+### D.2 与 WSL2 的不同之处
+
+#### 1. 安装 Docker（原生 systemd 管理）
+
+```bash
+# Ubuntu / Debian
+sudo apt update && sudo apt install -y docker.io docker-compose-v2
+sudo systemctl enable docker --now      # 开机自启 + 立即启动
+
+# CentOS / RHEL / Fedora
+sudo dnf install -y docker docker-compose-plugin
+sudo systemctl enable docker --now
+
+# 免 sudo 使用（所有发行版通用）
+sudo usermod -aG docker $USER
+# 退出重新登录生效
+```
+
+> 💡 **原生 Linux 的最大优势**：`systemctl` 管理 dockerd，不需要像 WSL2 那样每次手动 `sudo dockerd &`。
+
+#### 2. 不需要 `wsl` 命令
+
+```bash
+# ❌ WSL2 需要
+wsl -d Ubuntu-24.04
+cd /mnt/d/docker-images
+
+# ✅ 原生 Linux 直接在本地磁盘
+cd /home/user/docker-images
+# 或
+cd /data/docker-images
+```
+
+#### 3. 路径映射更简洁
+
+```yaml
+# WSL2 访问 Windows 磁盘
+volumes:
+  - /mnt/d/app/LLM/models:/root/.cache/huggingface:ro
+
+# 原生 Linux — 纯本地路径
+volumes:
+  - /home/user/models:/root/.cache/huggingface:ro
+  # 或如果放在同一目录下
+  - ./models:/root/.cache/huggingface:ro
+```
+
+#### 4. daemon.json — 推荐默认 runtime
+
+原生 Linux 上 GPU 直通更稳定，可以设为默认 runtime：
+
+```json
+{
+  "data-root": "/var/lib/docker",
+  "default-runtime": "nvidia",
+  "runtimes": {
+    "nvidia": {
+      "path": "nvidia-container-runtime",
+      "runtimeArgs": []
+    }
+  }
+}
+```
+
+> ⚠️ **与 WSL2 的区别**：WSL2 强烈不建议 `"default-runtime": "nvidia"`（会导致 postgres/redis 崩溃）。原生 Linux 上可以安全使用。
+
+#### 5. vLLM 原生 UVA 支持
+
+原生 Linux 上 **不需要** `vllm_entrypoint.sh` 补丁，UVA (Unified Virtual Addressing) 在裸机 GPU 上原生可用：
+
+```yaml
+# 原生 Linux 的 vllm 配置（无需 patch）
+vllm:
+  image: vllm/vllm-openai:latest
+  runtime: nvidia
+  ports:
+    - "3080:3080"
+  # entrypoint: ["/vllm_entrypoint.sh"]  ← 不需要！
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+  volumes:
+    - /home/user/models:/root/.cache/huggingface:ro
+  command:
+    - "--model"
+    - "/root/.cache/huggingface/models/qwen2"
+    - "--port" "3080"
+    - "--host" "0.0.0.0"
+```
+
+#### 6. 文件系统性能
+
+| 操作 | WSL2 | 原生 Linux |
+|---|---|---|
+| 模型加载（7B） | ~20-30s (9P 跨文件系统开销) | ~5-10s (ext4 直读) |
+| volume 读写 | ext4 上快，NTFS 挂载慢 | 全部原生速度 |
+| 符号链接 | NTFS 不支持 → 需实体文件 | 完全支持 |
+
+### D.3 原生 Linux 极简部署流程
+
+```bash
+# 1. 安装 Docker（选一种）
+sudo apt install -y docker.io docker-compose-v2              # Ubuntu/Debian
+sudo dnf install -y docker docker-compose-plugin             # Fedora/CentOS
+
+# 2. 安装 GPU 支持
+sudo apt install -y nvidia-container-toolkit                  # 与 WSL2 相同
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# 3. 加载镜像 + 启动
+cd /path/to/docker-images
+docker load -i infra-images-latest.tar
+docker load -i monitoring-images-latest.tar
+docker load -i ollama-latest.tar
+docker load -i vllm-openai-latest.tar
+docker load -i open-webui-main.tar
+
+docker network create backend 2>/dev/null
+docker network create llm-net 2>/dev/null
+docker compose up -d
+
+# 4. 验证
+docker ps
+nvidia-smi
+```
+
+---
+
+## 附录 E：双系统共享数据
+
+> 适用于 Windows + Linux 双系统，Docker 数据在两个系统间共用。
+
+### E.1 共享策略
+
+把镜像 `/ models / compose 文件` 放在 **NTFS 分区**（Windows 可读写），Linux 挂载后也能访问：
+
+```
+D:\docker-images\              ← Windows 直接访问
+    ├── compose.yml
+    ├── *.tar                   ← 镜像包
+    ├── models\                 ← AI 模型目录
+    └── docker-data\            ← 可选：Docker volume 数据
+
+Linux 挂载后:
+    /mnt/d/docker-images/       ← 同一份数据
+```
+
+### E.2 Linux 端挂载 NTFS 分区
+
+```bash
+# 查看 NTFS 分区
+sudo fdisk -l | grep NTFS
+
+# 编辑 fstab 自动挂载（示例）
+# /etc/fstab
+UUID=你的NTFS分区UUID  /mnt/d  ntfs-3g  defaults,uid=1000,gid=1000,umask=022  0  0
+
+# 手动挂载
+sudo mount -t ntfs-3g /dev/nvme0n1p4 /mnt/d
+```
+
+### E.3 注意事项
+
+1. **docker load 两遍** — 镜像加载后存储在 Docker 内部（`/var/lib/docker`），每个系统需要各自 `docker load -i xxx.tar` 一次。但 `.tar` 文件本身只需存一份。
+
+2. **模型文件共享** — AI 模型（几十 GB）建议用 volume 挂载到容器，而非 `docker cp` 进去，这样可以两边共用：
+   ```yaml
+   volumes:
+     # 两边都能访问同一个模型目录
+     - /mnt/d/docker-images/models:/root/.cache/huggingface:ro
+   ```
+
+3. **Docker volumes 不互通** — Docker 的命名卷（如 `pgdata`）存储在每个系统各自的 `/var/lib/docker/volumes/` 里，不能跨系统共享。如需共享，改用 bind mount。
+
+4. **换行符再次提醒** — Git 在 Windows 上可能把 `.sh` 改成 CRLF，务必设置：
+   ```bash
+   # Linux 端运行
+   git config --global core.autocrlf input
+   # 或转换已有文件
+   sed -i 's/\r$//' *.sh compose.yml
+   ```
