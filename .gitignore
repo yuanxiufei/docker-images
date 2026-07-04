@@ -1,0 +1,5 @@
+# Docker 镜像离线包（远超 100MB 限制，不上传）
+*.tar
+
+# IDE
+.codebuddy/
