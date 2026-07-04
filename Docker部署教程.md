@@ -175,9 +175,13 @@ docker compose up -d
 docker ps
 ```
 
+> 部署成功后如何对外提供 API？→ 参见 [第九章 对外映射](#九对外映射)。
+
 ---
 
 ## 五、基础设施部署
+
+> 💡 **网络隔离说明**：基础设施和监控放在 `backend` 网络，与 AI 推理的 `llm-net` 隔离。这样 AI 服务不直接访问数据库/缓存，监控也不暴露给前端调用链。若需要 Grafana 监控 Ollama/vLLM，可给 grafana 容器同时加入两个网络。
 
 ### 5.1 PostgreSQL 16
 
@@ -250,6 +254,24 @@ qdrant:
 
 > 💡 gRPC(6333) 性能更好适合高频写入，HTTP(6334) 方便调试。
 
+### 5.4 卷（Volume）声明
+
+以上服务引用的命名卷需在 compose 文件底部声明：
+
+```yaml
+volumes:
+  pgdata:
+  redisdata:
+  qdrantdata:
+  ollamadata:
+  webuidata:
+  promdata:
+  amdata:
+  grafanadata:
+```
+
+> 💡 Docker 自动管理这些卷的存储路径（通常在 `/var/lib/docker/volumes/`），删容器不会丢数据。如需绑定到宿主机目录，改为 `- ./data/pg:/var/lib/postgresql/data` 即可。
+
 ---
 
 ## 六、监控部署
@@ -271,7 +293,20 @@ prometheus:
 
 **验证**：`curl http://localhost:9090`
 
-> ⚠️ 默认只自监控。接其他 exporter（Redis/PostgreSQL exporter）需额外挂载 `prometheus.yml`。
+**最小可用配置**（挂载到 `/etc/prometheus/prometheus.yml`）：
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+
+> 💡 接其他 exporter 时在此文件追加 `scrape_configs` 即可。  
+> 💡 推荐 Grafana Dashboard：**3662**（Prometheus 自监控）、**1860**（Node Exporter），在 Grafana → Dashboards → Import 里输入 ID 一键导入。
 
 ### 6.2 Alertmanager
 
@@ -545,30 +580,7 @@ vllm:
 
 ### vllm_entrypoint.sh（WSL2 UVA 补丁）
 
-```bash
-#!/bin/bash
-python3 -c "
-import re
-path = '/usr/local/lib/python3.12/dist-packages/vllm/utils/platform_utils.py'
-with open(path, 'r') as f:
-    content = f.read()
-old = '''@cache
-def is_uva_available() -> bool:
-    \"\"\"Check if Unified Virtual Addressing (UVA) is available.\"\"\"
-    from vllm.platforms import current_platform
-    return is_pin_memory_available() or current_platform.is_cpu()'''
-new = '''@cache
-def is_uva_available() -> bool:
-    return True'''
-if old in content:
-    content = content.replace(old, new)
-    print('Patched is_uva_available (WSL2 workaround)')
-else:
-    content = re.sub(r'def is_uva_available\(\) -> bool:.*?(?=\n@cache|\ndef |\Z)', 'def is_uva_available() -> bool:\n    return True\n', content, flags=re.DOTALL)
-    with open(path, 'w') as f:
-        f.write(content)
-" && exec python3 -m vllm.entrypoints.openai.api_server "$@"
-```
+> 详见项目根目录 `vllm_entrypoint.sh`，核心功能：启动前自动 patch `is_uva_available()` 返回 True，绕过 WSL2 不支持 UVA 的限制。
 
 ### 可用模型路径
 
