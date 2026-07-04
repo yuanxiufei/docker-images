@@ -1,0 +1,428 @@
+# ============================================================
+# compose.unified.yml — 统一全栈 AI 平台部署
+# 
+# 合并 docker-images (基础设施层) + ai-fullstack-platform (应用层)
+# 
+# 平台文档: docs/deployment/部署概览.md (ai-fullstack-platform 项目)
+# 
+# 架构：
+#   基础设施 ─── docker-images
+#     ├── PostgreSQL 16 (alias: db)
+#     ├── Redis 7
+#     ├── Qdrant 向量数据库
+#     ├── Ollama LLM 推理
+#     ├── vLLM 高性能推理 (GPU)
+#     ├── Open WebUI 对话面板
+#     ├── Prometheus 指标采集
+#     ├── Alertmanager 告警
+#     └── Grafana 可视化
+#   
+#   应用层 ─── ai-fullstack-platform
+#     ├── backend FastAPI (端口 18000)
+#     ├── celery-worker 异步任务 (Windows 需 --pool=solo)
+#     ├── prestart 数据库迁移
+#     ├── adminer 数据库管理 (端口 18080)
+#     ├── studio-client AI 编辑器 C 端
+#     ├── studio-admin 项目管理端
+#     ├── video-client 视频生成 C 端
+#     └── video-admin 视频管理端
+#
+# 前置条件:
+#   docker network create ai-platform-net  (仅需首次)
+#   PLATFORM_DIR 指向 ai-fullstack-platform 项目路径
+#
+# 启动:
+#   docker compose -f compose.unified.yml up -d
+#   docker compose -f compose.unified.yml up -d --build   (首次/代码更新)
+#
+# Windows 用户注意:
+#   - celery-worker 在 Windows 容器下需要 --pool=solo（prefork 不支持）
+#   - 取消下面 celery-worker command 行注释中的 --pool=solo 即可
+# ============================================================
+
+services:
+  # ══════════════════ 基础设施层 ══════════════════
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-studio}"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 10s
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-studio}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      ai-platform-net:
+        # 别名 "db" 兼容 ai-fullstack-platform 的内部引用
+        aliases:
+          - db
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - ai-platform-net
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      retries: 5
+      start_period: 15s
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      QDRANT__SERVICE__HTTP_PORT: 6333
+    networks:
+      - ai-platform-net
+
+  # ══════════════════ AI 模型服务 ══════════════════
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    runtime: nvidia
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollamadata:/root/.ollama
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    networks:
+      - ai-platform-net
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    restart: unless-stopped
+    runtime: nvidia
+    ports:
+      - "3080:3080"
+    entrypoint: ["/vllm_entrypoint.sh"]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    volumes:
+      - ${MODELS_DIR:-./models/huggingface}:/root/.cache/huggingface:ro
+      - ./vllm_entrypoint.sh:/vllm_entrypoint.sh:ro
+    command:
+      - "--model"
+      - "/root/.cache/huggingface/models/qwen2"
+      - "--port"
+      - "3080"
+      - "--host"
+      - "0.0.0.0"
+    networks:
+      - ai-platform-net
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    ports:
+      - "3090:8080"
+    volumes:
+      - webuidata:/app/backend/data
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      OPENAI_API_BASE_URLS: http://vllm:3080/v1
+    networks:
+      - ai-platform-net
+
+  # ══════════════════ 应用层 (来自 ai-fullstack-platform) ══════════════════
+
+  prestart:
+    build:
+      context: ${PLATFORM_DIR:-../ai-fullstack-platform}
+      dockerfile: backend/Dockerfile
+    image: ${DOCKER_IMAGE_BACKEND:-ai-platform-backend}:${TAG:-latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+        restart: true
+    command: bash scripts/prestart.sh
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - SECRET_KEY=${SECRET_KEY:-changethis}
+      - FIRST_SUPERUSER=${FIRST_SUPERUSER:-admin@example.com}
+      - FIRST_SUPERUSER_PASSWORD=${FIRST_SUPERUSER_PASSWORD:-changethis}
+      - POSTGRES_SERVER=db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-studio}
+      - POSTGRES_USER=${POSTGRES_USER:-admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-admin123}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:5173}
+      - FRONTEND_HOST=${FRONTEND_HOST:-http://localhost:5173}
+    networks:
+      - ai-platform-net
+
+  backend:
+    build:
+      context: ${PLATFORM_DIR:-../ai-fullstack-platform}
+      dockerfile: backend/Dockerfile
+    image: ${DOCKER_IMAGE_BACKEND:-ai-platform-backend}:${TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+        restart: true
+      prestart:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/utils/health-check/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "18000:8000"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - SECRET_KEY=${SECRET_KEY:-changethis}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-11520}
+      - FIRST_SUPERUSER=${FIRST_SUPERUSER:-admin@example.com}
+      - FIRST_SUPERUSER_PASSWORD=${FIRST_SUPERUSER_PASSWORD:-changethis}
+      - FRONTEND_HOST=${FRONTEND_HOST:-http://localhost:5173}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:5173}
+      # 数据库
+      - POSTGRES_SERVER=db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-studio}
+      - POSTGRES_USER=${POSTGRES_USER:-admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-admin123}
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_ENABLED=true
+      # Qdrant
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      # Celery
+      - TASK_QUEUE_ENABLED=true
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      # AI 模型
+      - MODEL_PREFER_LOCAL=${MODEL_PREFER_LOCAL:-true}
+      - MODEL_FALLBACK_ENABLED=${MODEL_FALLBACK_ENABLED:-true}
+      - MODEL_REQUEST_TIMEOUT=${MODEL_REQUEST_TIMEOUT:-30}
+      - MODEL_MAX_RETRIES=${MODEL_MAX_RETRIES:-2}
+      - MODELS_DIR=${MODELS_DIR:-models}
+      # 邮件 (可选)
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - EMAILS_FROM_EMAIL=${EMAILS_FROM_EMAIL:-noreply@example.com}
+    volumes:
+      - ${MODELS_DIR:-./models/huggingface}:/data/models:ro
+    networks:
+      - ai-platform-net
+
+  celery-worker:
+    build:
+      context: ${PLATFORM_DIR:-../ai-fullstack-platform}
+      dockerfile: backend/Dockerfile
+    image: ${DOCKER_IMAGE_BACKEND:-ai-platform-backend}:${TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    # Linux: 默认 prefork pool 性能最优
+    # Windows: 取消下行注释，添加 --pool=solo
+    command: celery -A task_queue.celery_app worker --loglevel=info
+    # command: celery -A task_queue.celery_app worker --loglevel=info --pool=solo
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - POSTGRES_SERVER=db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-studio}
+      - POSTGRES_USER=${POSTGRES_USER:-admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-admin123}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - SECRET_KEY=${SECRET_KEY:-changethis}
+    volumes:
+      - ${PLATFORM_DIR:-../ai-fullstack-platform}/workers:/app/workers:ro
+      - ${PLATFORM_DIR:-../ai-fullstack-platform}/task_queue:/app/task_queue:ro
+      - ${MODELS_DIR:-./models/huggingface}:/data/models:ro
+    networks:
+      - ai-platform-net
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "18080:18080"
+    environment:
+      - ADMINER_DESIGN=pepa-linha-dark
+    networks:
+      - ai-platform-net
+
+  # ══════════════════ 前端 (Nginx 静态服务) ══════════════════
+
+  studio-client:
+    build:
+      context: ${PLATFORM_DIR:-../ai-fullstack-platform}
+      dockerfile: studio-client/Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:18000}
+        - NODE_ENV=production
+    image: ${DOCKER_IMAGE_STUDIO_CLIENT:-ai-platform-studio-client}:${TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+    networks:
+      - ai-platform-net
+
+  studio-admin:
+    build:
+      context: ${PLATFORM_DIR:-../ai-fullstack-platform}
+      dockerfile: studio-admin/Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:18000}
+        - NODE_ENV=production
+    image: ${DOCKER_IMAGE_STUDIO_ADMIN:-ai-platform-studio-admin}:${TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5175:80"
+    networks:
+      - ai-platform-net
+
+  video-client:
+    build:
+      context: ${PLATFORM_DIR:-../ai-fullstack-platform}
+      dockerfile: video-client/Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:18000}
+        - NODE_ENV=production
+    image: ${DOCKER_IMAGE_VIDEO_CLIENT:-ai-platform-video-client}:${TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5174:80"
+    networks:
+      - ai-platform-net
+
+  video-admin:
+    build:
+      context: ${PLATFORM_DIR:-../ai-fullstack-platform}
+      dockerfile: video-admin/Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:18000}
+        - NODE_ENV=production
+    image: ${DOCKER_IMAGE_VIDEO_ADMIN:-ai-platform-video-admin}:${TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5176:80"
+    networks:
+      - ai-platform-net
+
+  # ══════════════════ 监控层 ══════════════════
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - promdata:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    networks:
+      - ai-platform-net
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - amdata:/alertmanager
+    networks:
+      - ai-platform-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "9091:3000"
+    volumes:
+      - grafanadata:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    networks:
+      - ai-platform-net
+
+# ══════════════════ 存储卷 ══════════════════
+
+volumes:
+  pgdata:
+  redisdata:
+  qdrantdata:
+  ollamadata:
+  webuidata:
+  promdata:
+  amdata:
+  grafanadata:
+
+# ══════════════════ 网络 ══════════════════
+
+networks:
+  ai-platform-net:
+    driver: bridge
+    name: ai-platform-net
